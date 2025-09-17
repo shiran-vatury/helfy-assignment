@@ -1,0 +1,76 @@
+{
+  "uid": "eco_system_dashboard",
+  "title": "Eco-System CDC Dashboard",
+  "timezone": "browser",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {
+      "type": "piechart",
+      "title": "CDC Operations (Last 1 Hour)",
+      "id": 1,
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation) (cdc_operations_total)",
+          "legendFormat": "{{operation}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "table",
+      "title": "Raw CDC Events",
+      "id": 2,
+      "datasource": "Elasticsearch",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "query": "*",
+          "metrics": [],
+          "bucketAggs": [
+            {
+              "type": "terms",
+              "field": "table.keyword",
+              "id": "1",
+              "size": 10
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      }
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  }
+}
