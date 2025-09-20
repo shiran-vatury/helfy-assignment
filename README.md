@@ -15,4 +15,3 @@ via filebeat
 Prometheus then scrapes the exporter’s `/metrics` endpoint and stores the time-series data for visualization in Grafana.
 
 
-#### I didn't manage to make grafana use the folder structure correctly
