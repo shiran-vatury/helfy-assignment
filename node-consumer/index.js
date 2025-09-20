@@ -6,7 +6,7 @@ const path = require("path");
 
 // Environment variables
 const kafkaBroker = process.env.KAFKA_BROKER || "kafka:9092";
-const cdcTopic = process.env.CDC_TOPIC || "cdc_events";
+const cdcTopic = process.env.CDC_TOPIC || "events";
 const logFilePath = "/usr/share/filebeat/logs/cdc.log";
 
 // Prometheus counter for CDC operations
@@ -27,20 +27,36 @@ app.listen(port, () => console.log(`Prometheus metrics available at http://local
 
 // Kafka consumer setup
 const kafka = new Kafka({ brokers: [kafkaBroker] });
-const consumer = kafka.consumer({ groupId: "cdc-group" });
+const consumer = kafka.consumer({ groupId: process.env.KAFKA_CONSUMER_GROUP || "cdc-group" });
 
 async function runConsumer() {
-  await consumer.connect();
+  // Retry loop in case Kafka is not ready yet
+  while (true) {
+    try {
+      await consumer.connect();
+      break;
+    } catch (err) {
+      console.log("Kafka not ready yet, retrying in 2s...", err.message);
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  }
+
   await consumer.subscribe({ topic: cdcTopic, fromBeginning: true });
 
   await consumer.run({
     eachMessage: async ({ message }) => {
-      const event = JSON.parse(message.value.toString());
+      let event;
+      try {
+        event = JSON.parse(message.value.toString());
+      } catch (err) {
+        console.error("Invalid JSON message, skipping:", message.value.toString());
+        return;
+      }
 
       // Update Prometheus counter
       cdcCounter.inc({ table: event.table, operation: event.type });
 
-      // Log event to file for Filebeat
+      // Log event to file
       const logLine = `${new Date().toISOString()} | Table: ${event.table} | Operation: ${event.type} | Data: ${JSON.stringify(event.data)}\n`;
       fs.appendFileSync(logFilePath, logLine);
 

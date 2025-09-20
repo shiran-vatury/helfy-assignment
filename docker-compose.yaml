@@ -1,4 +1,3 @@
-version: "3.8"
 
 services:
   # -------------------------
@@ -7,6 +6,11 @@ services:
   pd:
     image: pingcap/pd
     container_name: pd
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://pd:2379/pd/api/v1/members"]
+      interval: 5s
+      retries: 10
+    restart: always
     ports:
       - "2379:2379"
     command:
@@ -14,18 +18,26 @@ services:
       - --data-dir=/pd/data
       - --client-urls=http://0.0.0.0:2379
       - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+
 
   tikv:
     image: pingcap/tikv
     container_name: tikv
     depends_on:
-      - pd
+      pd:
+        condition: service_healthy
+    restart: always
     command:
       - --pd=pd:2379
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
       - --data-dir=/tikv/data
 
+
   tidb:
-    image: pingcap/tidb
+    build: ./db
     container_name: tidb
     restart: always
     depends_on:
@@ -37,9 +49,37 @@ services:
     command:
       - --store=tikv
       - --path=pd:2379
-    volumes:
-      - ./db:/docker-entrypoint-initdb.d  # Mount folder with init.sql
+      - --advertise-address=tidb
+    healthcheck:
+      test: ["CMD", "mysqladmin", "-h", "127.0.0.1", "-P", "4000", "-u", "root", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
+
+  # -------------------------
+  # TiDB Init (runs SQL once)
+  # -------------------------
+  tidb-init:
+    image: mysql:8.0
+    container_name: tidb-init
+    depends_on:
+      tidb:
+        condition: service_healthy
+    volumes:
+      - ./db:/db   # contains init.sql
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for TiDB...' &&
+        until mysql -h tidb -P 4000 -u root -e 'SELECT 1' >/dev/null 2>&1; do
+          sleep 2;
+        done &&
+        echo 'Running init.sql...' &&
+        mysql -h tidb -P 4000 -u root < /db/init.sql &&
+        echo 'Init complete.'
+      "
+      
 
   # -------------------------
   # TiDB CDC
@@ -48,24 +88,15 @@ services:
     image: pingcap/ticdc
     container_name: tidb-cdc
     depends_on:
-      - tidb
-      - pd
-    command: ["/cdc", "server", "--pd=","http://pd:2379"]
+      tidb:
+        condition: service_healthy
+      pd:
+        condition: service_healthy
+    command: ["/cdc", "server", "--pd=http://pd:2379"]
     ports:
       - "8300:8300" 
-
-
-  # -------------------------
-  # Kafka & Zookeeper
-  # -------------------------
-  zookeeper:
-    image: bitnami/zookeeper:latest
-    container_name: zookeeper
-    environment:
-    - ALLOW_ANONYMOUS_LOGIN=yes
-    ports:
-      - "2181:2181"
-
+    restart: always
+      
   kafka:
     image: bitnami/kafka:latest
     container_name: kafka
@@ -73,13 +104,28 @@ services:
     ports:
       - "9092:9092"
     environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_LISTENERS=PLAINTEXT://:9092
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
       - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=false 
+
+  kafka-init:
+    container_name: kafka-init
+    image: bitnami/kafka:latest
     depends_on:
-      - zookeeper
+      - kafka
+    entrypoint: >
+      sh -c "
+        until kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do
+          sleep 2;
+        done &&
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --topic events --if-not-exists
+      "
+
 
   # -------------------------
   # Node.js Consumer
@@ -89,11 +135,14 @@ services:
     container_name: node-consumer
     restart: always
     depends_on:
-      - kafka
-      - tidb
+      kafka-init:
+        condition: service_completed_successfully
+      tidb:
+        condition: service_healthy
     environment:
       KAFKA_BROKER: kafka:9092
-      CDC_TOPIC: cdc_events
+      CDC_TOPIC: events
+      KAFKA_CONSUMER_GROUP: fresh-group
     ports:
       - "3000:3000"  # For Prometheus metrics
 
@@ -101,12 +150,10 @@ services:
   # Monitoring: Prometheus & Grafana
   # -------------------------
   prometheus:
-    image: prom/prometheus:latest
+    build: ./prometheus
     container_name: prometheus
     ports:
       - "9090:9090"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
 
   grafana:
     image: grafana/grafana:latest
@@ -119,8 +166,10 @@ services:
     depends_on:
       - prometheus
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning/dashboards/dashboard.yml:/etc/grafana/provisioning/dashboards/main.yaml
+      - ./grafana/provisioning/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    restart: always
 
   # -------------------------
   # Logging: Elasticsearch & Filebeat
@@ -130,8 +179,15 @@ services:
     container_name: elasticsearch
     environment:
       - discovery.type=single-node
+      - xpack.security.enabled=false      # disable auth/certs
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g        # JVM heap size
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     ports:
       - "9200:9200"
+      - "9300:9300"
 
   filebeat:
     image: docker.elastic.co/beats/filebeat:8.15.0
@@ -142,3 +198,6 @@ services:
     depends_on:
       - elasticsearch
 
+
+volumes:
+  grafana_data:

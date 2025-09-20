@@ -5,5 +5,5 @@ filebeat.inputs:
       - /usr/share/filebeat/logs/*.log
 
 output.elasticsearch:
-  hosts: ["elasticsearch:9200"]
+  hosts: ["http://elasticsearch:9200"]   
   index: "cdc-events-%{+yyyy.MM.dd}"
